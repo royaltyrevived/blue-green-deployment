@@ -1,0 +1,94 @@
+name: Blue-Green Deployment with SSM
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Node.js (or other language/environment if applicable)
+      uses: actions/setup-node@v3
+      with:
+        node-version: '16'  # Adjust as necessary for your project's requirements
+
+    - name: Install dependencies
+      run: |
+        npm install  # or other install commands if not using Node.js
+
+    - name: Run Lint
+      run: |
+        npm run lint  # or the appropriate lint command for your project
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Log in to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build and push Docker image
+      run: |
+        IMAGE_TAG=latest
+        ECR_URI=${{ secrets.ECR_REPOSITORY_URI }}
+
+        # Build the Docker image
+        docker build -t $ECR_URI:$IMAGE_TAG .
+
+        # Push the Docker image to Amazon ECR
+        docker push $ECR_URI:$IMAGE_TAG
+
+    - name: Deploy to Green container using SSM
+      run: |
+        aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --targets "Key=instanceids,Values=${{ secrets.INSTANCE_ID }}" \
+          --parameters 'commands=["docker pull ${{ secrets.ECR_REPOSITORY_URI }}:latest", "docker stop holista-client-dev-green || true", "docker run -d --name holista-client-dev-green -p 8081:80 ${{ secrets.ECR_REPOSITORY_URI }}:latest"]' \
+          --region ${{ secrets.AWS_REGION }}
+
+    - name: Wait for Green container to stabilize
+      run: sleep 60
+
+    - name: Health Check for Green Container
+      run: |
+        curl --fail http://ec2-instance-ip:8081/health || exit 1
+
+    - name: Run Functional Tests
+      run: |
+        docker run --rm -v $PWD/tests:/tests your-test-image:latest /tests/run-tests.sh || exit 1
+
+    - name: Smoke Test
+      run: |
+        curl --fail http://ec2-instance-ip:8081/ || exit 1
+
+    - name: Performance Test
+      run: |
+        ab -n 100 -c 10 http://ec2-instance-ip:8081/ || exit 1
+
+    - name: Rollback or Cleanup
+      if: failure()
+      run: |
+        aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --targets "Key=instanceids,Values=${{ secrets.INSTANCE_ID }}" \
+          --parameters 'commands=["docker stop holista-client-dev-green || true", "docker rm holista-client-dev-green || true", "docker pull yourusername/yourapp:previous-stable-tag", "docker run -d --name holista-client-dev-blue -p 8080:80 yourusername/yourapp:previous-stable-tag", "sudo sed -i \'s/proxy_pass http:\/\/green;/proxy_pass http:\/\/blue;/g\' /etc/nginx/conf.d/default.conf", "sudo nginx -s reload"]' \
+          --region ${{ secrets.AWS_REGION }}
+
+    - name: Cleanup Blue container and finalize deployment
+      if: success()
+      run: |
+        aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --targets "Key=instanceids,Values=${{ secrets.INSTANCE_ID }}" \
+          --parameters 'commands=["docker stop holista-client-dev-blue || true", "docker rm holista-client-dev-blue || true"]' \
+          --region ${{ secrets.AWS_REGION }}
